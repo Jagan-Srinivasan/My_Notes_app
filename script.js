@@ -9,6 +9,41 @@ const firebaseConfig = {
     messagingSenderId: "447706126595",
     appId: "1:447706126595:web:9404d81fbab4f7e0a0b136"
 };
+async function loadNotes() {
+  if (!currentUser) {
+    console.warn("No user is logged in, cannot load notes.");
+    return;
+  }
+
+  try {
+    console.log("Loading notes for UID:", currentUser.uid);
+
+    const snapshot = await db.collection('notes')
+      .where('userId', '==', currentUser.uid)
+      .where('createdAt', '!=', null)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    console.log("Snapshot size:", snapshot.size);
+
+    allNotes = snapshot.docs.map(doc => {
+      const data = doc.data();
+      console.log("Loaded note:", data);
+      return {
+        id: doc.id,
+        ...data
+      };
+    });
+
+    updateTagFilter();
+    applyFilters();
+
+  } catch (error) {
+    console.error('Error loading notes:', error);
+    NotificationManager.show('Failed to load notes', 'error');
+  }
+}
+
 
 // Initialize Firebase
 firebase.initializeApp(firebaseConfig);
@@ -372,127 +407,93 @@ function handleFileSelect(files) {
 }
 
 async function uploadFiles() {
-    if (selectedFiles.length === 0) {
-        NotificationManager.show('Please select files to upload', 'error');
-        return;
-    }
+  if (selectedFiles.length === 0) {
+    NotificationManager.show('Please select files to upload', 'error');
+    return;
+  }
 
-    if (!currentUser) {
-        NotificationManager.show('Please sign in to upload files', 'error');
-        return;
-    }
+  if (!currentUser) {
+    NotificationManager.show('Please sign in to upload files', 'error');
+    return;
+  }
 
-    const title = noteTitle ? noteTitle.value.trim() : 'Untitled';
-    if (!title) {
-        NotificationManager.show('Please enter a note title', 'error');
-        return;
-    }
+  const title = noteTitle ? noteTitle.value.trim() : 'Untitled';
+  if (!title) {
+    NotificationManager.show('Please enter a note title', 'error');
+    return;
+  }
 
-    const tags = noteTags ? noteTags.value.split(',').map(tag => tag.trim()).filter(tag => tag) : [];
+  const tags = noteTags
+    ? noteTags.value.split(',').map(tag => tag.trim()).filter(tag => tag)
+    : [];
 
-    try {
-        if (uploadProgress) {
-            uploadProgress.classList.remove('hidden');
-        }
-        if (progressFill) {
-            progressFill.style.width = '0%';
-        }
-        if (progressText) {
-            progressText.textContent = '0%';
-        }
+  try {
+    if (uploadProgress) uploadProgress.classList.remove('hidden');
+    if (progressFill) progressFill.style.width = '0%';
+    if (progressText) progressText.textContent = '0%';
 
-        const uploadPromises = selectedFiles.map(async (file, index) => {
-            // Validate file size
-            if (file.size > 1024 * 1024) {
-                throw new Error(`File ${file.name} is too large. Maximum size is 1MB for free tier.`);
-            }
+    const uploadedFiles = [];
 
-            const base64Data = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-            });
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
+      let fileRecord = {
+        name: file.name,
+        size: file.size,
+        type: file.type || 'application/octet-stream',
+      };
 
-            // Update progress
-            const progress = ((index + 1) / selectedFiles.length) * 100;
-            if (progressFill) progressFill.style.width = progress + '%';
-            if (progressText) progressText.textContent = Math.round(progress) + '%';
-
-            return {
-                name: file.name,
-                data: base64Data,
-                size: file.size,
-                type: file.type || 'application/octet-stream'
-            };
+      if (file.size <= 1024 * 1024) {
+        // 📦 Save as base64 for small files
+        const base64Data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
         });
+        fileRecord.data = base64Data;
+      } else {
+        // ☁️ Upload to Firebase Storage for larger files
+        const storageRef = firebase.storage().ref();
+        const fileRef = storageRef.child(`user_uploads/${currentUser.uid}/${Date.now()}_${file.name}`);
+        await fileRef.put(file);
+        const downloadURL = await fileRef.getDownloadURL();
+        fileRecord.downloadURL = downloadURL;
+      }
 
-        const uploadedFiles = await Promise.all(uploadPromises);
+      uploadedFiles.push(fileRecord);
 
-        const noteData = {
-            title,
-            tags,
-            files: uploadedFiles,
-            userId: currentUser.uid,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-        };
-        console.log("Final noteData before save:", noteData);
-        await db.collection('notes').add(noteData);
-
-
-        NotificationManager.show(`Successfully uploaded ${uploadedFiles.length} file(s)!`, 'success');
-
-        resetUploadForm();
-        await loadNotes();
-
-    } catch (error) {
-        console.error('Upload error:', error);
-        NotificationManager.show(error.message, 'error');
-
-        if (uploadProgress) uploadProgress.classList.add('hidden');
-        if (progressFill) progressFill.style.width = '0%';
-        if (progressText) progressText.textContent = '0%';
+      // Update progress
+      const progress = ((i + 1) / selectedFiles.length) * 100;
+      if (progressFill) progressFill.style.width = progress + '%';
+      if (progressText) progressText.textContent = Math.round(progress) + '%';
     }
+
+    const noteData = {
+      title,
+      tags,
+      files: uploadedFiles,
+      userId: currentUser.uid,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    };
+
+    console.log("Final noteData before save:", noteData);
+    await db.collection('notes').add(noteData);
+
+    NotificationManager.show(`Successfully uploaded ${uploadedFiles.length} file(s)!`, 'success');
+
+    resetUploadForm();
+    await loadNotes();
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    NotificationManager.show(error.message, 'error');
+
+    if (uploadProgress) uploadProgress.classList.add('hidden');
+    if (progressFill) progressFill.style.width = '0%';
+    if (progressText) progressText.textContent = '0%';
+  }
 }
-
-
-// Notes Management
-async function loadNotes() {
-    if (!currentUser) {
-        console.warn("No user is logged in, cannot load notes.");
-        return;
-    }
-
-    try {
-        console.log("Loading notes for UID:", currentUser.uid);
-
-        const snapshot = await db.collection('notes')
-            .where('userId', '==', currentUser.uid)
-            .where('createdAt', '!=', null)  // ✅ Skip notes with missing timestamps
-            .orderBy('createdAt', 'desc')    // ✅ Sort newest first
-            .get();
-
-        console.log("Snapshot size:", snapshot.size);
-
-        allNotes = snapshot.docs.map(doc => {
-            const data = doc.data();
-            console.log("Loaded note:", data);
-            return {
-                id: doc.id,
-                ...data
-            };
-        });
-
-        updateTagFilter();
-        applyFilters();
-
-    } catch (error) {
-        console.error('Error loading notes:', error);
-        NotificationManager.show('Failed to load notes', 'error');
-    }
-}
-
 
 function updateTagFilter() {
     if (!tagFilter) return;
@@ -654,53 +655,54 @@ function closeDeleteModal() {
 }
 
 function previewNote(noteId) {
-    const note = allNotes.find(n => n.id === noteId);
-    if (!note || !note.files || note.files.length === 0) return;
+  const note = allNotes.find(n => n.id === noteId);
+  if (!note || !note.files || note.files.length === 0) {
+    NotificationManager.show("No file to preview", "error");
+    return;
+  }
 
-    const previewTitle = document.getElementById('previewTitle');
-    const previewContent = document.getElementById('previewContent');
+  const previewTitle = document.getElementById('previewTitle');
+  const previewContent = document.getElementById('previewContent');
+  const previewModal = document.getElementById('previewModal');
 
-    if (previewTitle) {
-        previewTitle.textContent = note.title;
-    }
+  if (!previewTitle || !previewContent || !previewModal) {
+    console.error("Missing preview modal elements in HTML.");
+    return;
+  }
 
-    if (previewContent) {
-        // Show first file preview
-        const file = note.files[0];
-        const fileType = file.type || '';
+  previewTitle.textContent = note.title;
 
-        if (fileType.startsWith('image/')) {
-            previewContent.innerHTML = `
-                <img src="${file.data}" alt="${file.name}" style="max-width: 100%; height: auto;">
-            `;
-        } else if (fileType === 'application/pdf') {
-            previewContent.innerHTML = `
-                <iframe src="${file.data}" style="width: 100%; height: 600px; border: none;"></iframe>
-            `;
-        } else {
-            previewContent.innerHTML = `
-                <div class="preview-fallback">
-                    <i class="fas fa-file-alt"></i>
-                    <h3>Preview not available</h3>
-                    <p>File: ${file.name}</p>
-                    <button onclick="downloadBase64File('${file.data}', '${file.name}')" class="save-btn">
-                        <i class="fas fa-download"></i> Download File
-                    </button>
-                </div>
-            `;
-        }
-    }
+  const file = note.files[0];
+  const fileType = file.type || '';
 
-    if (previewModal) {
-        previewModal.classList.remove('hidden');
-    }
+  if (fileType.startsWith('image/')) {
+    previewContent.innerHTML = `
+      <img src="${file.data}" alt="${file.name}" style="max-width: 100%; height: auto;">
+    `;
+  } else if (fileType === 'application/pdf') {
+    previewContent.innerHTML = `
+      <iframe src="${file.data}" style="width: 100%; height: 600px; border: none;"></iframe>
+    `;
+  } else {
+    previewContent.innerHTML = `
+      <div class="preview-fallback">
+        <i class="fas fa-file-alt"></i>
+        <h3>Preview not available</h3>
+        <p>File: ${file.name}</p>
+        <button onclick="downloadBase64File('${file.data}', '${file.name}')" class="save-btn">
+          <i class="fas fa-download"></i> Download File
+        </button>
+      </div>
+    `;
+  }
+
+  previewModal.classList.remove('hidden');
 }
-
 function closePreviewModal() {
-    if (previewModal) {
-        previewModal.classList.add('hidden');
-    }
+  const modal = document.getElementById('previewModal');
+  if (modal) modal.classList.add('hidden');
 }
+
 
 // Event Listeners
 document.addEventListener('DOMContentLoaded', function() {
